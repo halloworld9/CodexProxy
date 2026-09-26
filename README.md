@@ -311,6 +311,25 @@ Supported behavior includes:
 
 Some fields that the Codex backend rejects are removed or adapted before forwarding, such as unsupported `max_tokens`, `max_output_tokens`, and `stop` fields.
 
+## Fast mode
+
+For models whose discovered metadata includes the `priority` service tier, `/v1/models` also lists a `<model>-fast` alias. Using that alias sends the base model upstream with `service_tier: "priority"`. You can alternatively set `service_tier` in a Chat Completions or Responses request body (`"fast"` maps to `"priority"`; Chat Completions forwards only `priority` and `flex`), or use `X-Codex-Fast: true`. A false value (`0`, `false`, `off`, or `no`) removes the service tier even when the body or alias requests fast mode; the header takes precedence.
+
+Grok Build can select fast mode by model alias:
+
+```toml
+[model.sol-fast]
+model = "gpt-6-sol-fast"
+```
+
+Or keep the base model and set a static header:
+
+```toml
+[model.sol-fast]
+model = "gpt-6-sol"
+extra_headers = { "X-Codex-Fast" = "true" }
+```
+
 ## Anthropic Messages
 
 `/v1/messages` accepts Anthropic Messages-style requests and converts them through the same Codex backend.

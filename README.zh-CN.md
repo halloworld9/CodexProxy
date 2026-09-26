@@ -305,6 +305,25 @@ resp = client.images.edit(
 
 请求体默认限制为 100 MiB。可通过 `codex-proxy serve --max-body-mb N` 或 `CODEX_PROXY_MAX_REQUEST_BODY_MB=N` 调整。SSE 单个事件行限制为 32 MiB。
 
+## Fast mode
+
+当模型发现信息包含 `priority` service tier 时，`/v1/models` 还会列出 `<model>-fast` 别名。使用该别名时，代理向上游发送基础模型名及 `service_tier: "priority"`。也可以在 Chat Completions 或 Responses 请求体中设置 `service_tier`（`"fast"` 会映射为 `"priority"`；Chat Completions 只转发 `priority` 和 `flex`），或者发送 `X-Codex-Fast: true`。若请求头值为 `0`、`false`、`off` 或 `no`，即使别名或请求体要求 fast mode，也不会向上游发送 `service_tier`；请求头优先级最高。
+
+Grok Build 可以直接使用模型别名：
+
+```toml
+[model.sol-fast]
+model = "gpt-6-sol-fast"
+```
+
+也可以保留基础模型并设置静态请求头：
+
+```toml
+[model.sol-fast]
+model = "gpt-6-sol"
+extra_headers = { "X-Codex-Fast" = "true" }
+```
+
 ## CLI 命令
 
 ```bash

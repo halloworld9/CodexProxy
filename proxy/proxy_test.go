@@ -39,6 +39,125 @@ func (w *failingStreamWriter) Write([]byte) (int, error) {
 
 func (w *failingStreamWriter) Flush() {}
 
+func TestModelsHandlerListsFastAliases(t *testing.T) {
+	handler := makeModelsHandler([]string{"gpt-5.5", "gpt-5.4", "gpt-5.5-fast", "gpt-image-2"})
+	w := httptest.NewRecorder()
+	handler(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	var response struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var got []string
+	for _, model := range response.Data {
+		got = append(got, model.ID)
+	}
+	want := []string{"gpt-5.5", "gpt-5.4", "gpt-5.5-fast", "gpt-image-2"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("models = %v, want %v", got, want)
+	}
+}
+
+func TestTextEndpointsResolveFastMode(t *testing.T) {
+	tests := []struct {
+		name          string
+		handler       http.HandlerFunc
+		path          string
+		body          string
+		header        string
+		wantModel     string
+		wantTier      string
+		wantTierSet   bool
+		wantRespModel string
+	}{
+		{name: "chat alias", handler: handleChatCompletions, path: "/v1/chat/completions", body: `{"model":"gpt-5.5-fast","messages":[{"role":"user","content":"hi"}]}`, wantModel: "gpt-5.5", wantTier: "priority", wantTierSet: true, wantRespModel: "gpt-5.5-fast"},
+		{name: "chat body fast", handler: handleChatCompletions, path: "/v1/chat/completions", body: `{"model":"gpt-5.5","service_tier":"fast","messages":[{"role":"user","content":"hi"}]}`, wantModel: "gpt-5.5", wantTier: "priority", wantTierSet: true, wantRespModel: "gpt-5.5"},
+		{name: "chat openai auto tier dropped", handler: handleChatCompletions, path: "/v1/chat/completions", body: `{"model":"gpt-5.5","service_tier":"auto","messages":[{"role":"user","content":"hi"}]}`, wantModel: "gpt-5.5", wantRespModel: "gpt-5.5"},
+		{name: "messages anthropic tier dropped", handler: handleAnthropicMessages, path: "/v1/messages", body: `{"model":"gpt-5.5","service_tier":"standard_only","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, wantModel: "gpt-5.5", wantRespModel: "gpt-5.5"},
+		{name: "chat plain", handler: handleChatCompletions, path: "/v1/chat/completions", body: `{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}`, wantModel: "gpt-5.5", wantRespModel: "gpt-5.5"},
+		{name: "chat header on", handler: handleChatCompletions, path: "/v1/chat/completions", body: `{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}`, header: "true", wantModel: "gpt-5.5", wantTier: "priority", wantTierSet: true, wantRespModel: "gpt-5.5"},
+		{name: "chat header off", handler: handleChatCompletions, path: "/v1/chat/completions", body: `{"model":"gpt-5.5-fast","service_tier":"priority","messages":[{"role":"user","content":"hi"}]}`, header: "false", wantModel: "gpt-5.5", wantRespModel: "gpt-5.5-fast"},
+		{name: "messages alias", handler: handleAnthropicMessages, path: "/v1/messages", body: `{"model":"gpt-5.5-fast","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, wantModel: "gpt-5.5", wantTier: "priority", wantTierSet: true, wantRespModel: "gpt-5.5-fast"},
+		{name: "messages header", handler: handleAnthropicMessages, path: "/v1/messages", body: `{"model":"gpt-5.5","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, header: "on", wantModel: "gpt-5.5", wantTier: "priority", wantTierSet: true, wantRespModel: "gpt-5.5"},
+		{name: "responses alias", handler: handleResponses, path: "/v1/responses", body: `{"model":"gpt-5.5-fast","input":"hi"}`, wantModel: "gpt-5.5", wantTier: "priority", wantTierSet: true},
+		{name: "responses explicit", handler: handleResponses, path: "/v1/responses", body: `{"model":"gpt-5.5","service_tier":"standard","input":"hi"}`, wantModel: "gpt-5.5", wantTier: "standard", wantTierSet: true},
+		{name: "responses header off", handler: handleResponses, path: "/v1/responses", body: `{"model":"gpt-5.5-fast","service_tier":"fast","input":"hi"}`, header: "no", wantModel: "gpt-5.5"},
+		{name: "responses streaming alias", handler: handleResponses, path: "/v1/responses", body: `{"model":"gpt-5.5-fast","input":"hi","stream":true}`, wantModel: "gpt-5.5", wantTier: "priority", wantTierSet: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamReq map[string]interface{}
+			restore := installHandlerUpstream(t, func(body []byte) {
+				if err := json.Unmarshal(body, &upstreamReq); err != nil {
+					t.Fatalf("upstream JSON: %v", err)
+				}
+			})
+			defer restore()
+
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			if tt.header != "" {
+				req.Header.Set("X-Codex-Fast", tt.header)
+			}
+			w := httptest.NewRecorder()
+			tt.handler(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			if upstreamReq["model"] != tt.wantModel {
+				t.Fatalf("upstream model = %v, want %s", upstreamReq["model"], tt.wantModel)
+			}
+			tier, ok := upstreamReq["service_tier"].(string)
+			if ok != tt.wantTierSet || tier != tt.wantTier {
+				t.Fatalf("upstream service_tier = %q, %v; want %q, %v", tier, ok, tt.wantTier, tt.wantTierSet)
+			}
+			if tt.wantRespModel != "" {
+				var response map[string]interface{}
+				if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+					t.Fatalf("response JSON: %v", err)
+				}
+				if response["model"] != tt.wantRespModel {
+					t.Fatalf("response model = %v, want %s", response["model"], tt.wantRespModel)
+				}
+			}
+		})
+	}
+}
+
+type proxyRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f proxyRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func installHandlerUpstream(t *testing.T, inspect func([]byte)) func() {
+	t.Helper()
+	oldPool := auth.Pool
+	oldNormalClient := normalClient
+	oldStreamClient := streamClient
+	auth.Pool = auth.NewTokenPool([]auth.AccountConfig{{Name: "test", AccessToken: "token"}}, "round-robin")
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		inspect(body)
+		sse := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\ndata: [DONE]\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(sse))}, nil
+	})}
+	normalClient = client
+	streamClient = client
+	return func() {
+		auth.Pool = oldPool
+		normalClient = oldNormalClient
+		streamClient = oldStreamClient
+	}
+}
+
 func TestConvertToOpenAIFormat(t *testing.T) {
 	codexResp := map[string]interface{}{
 		"id": "resp_123",

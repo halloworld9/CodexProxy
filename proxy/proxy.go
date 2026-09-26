@@ -160,10 +160,14 @@ func Serve(ctx context.Context, host, port string, validateKey KeyValidator) err
 		return fmt.Errorf("cannot start proxy: %w", err)
 	}
 
-	models, err := auth.DiscoverModelsForManager(ctx, handle.Manager)
+	modelInfo, err := auth.DiscoverModelInfoForManager(ctx, handle.Manager)
 	if err != nil {
 		slog.Warn("model discovery failed; /v1/models will be empty and image generation unavailable until it succeeds", "error", err)
-		models = nil
+		modelInfo = nil
+	}
+	models := make([]string, len(modelInfo))
+	for i, model := range modelInfo {
+		models[i] = model.Slug
 	}
 
 	// baseModel for image requests is the first discovered chat model. If
@@ -174,6 +178,11 @@ func Serve(ctx context.Context, host, port string, validateKey KeyValidator) err
 		baseModel = models[0]
 	}
 	listedModels := append([]string{}, models...)
+	for _, model := range modelInfo {
+		if model.SupportsFast {
+			listedModels = append(listedModels, model.Slug+"-fast")
+		}
+	}
 	if baseModel != "" {
 		listedModels = append(listedModels, "gpt-image-2")
 	}
@@ -618,10 +627,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	clientWantsStream, _ := chatReq["stream"].(bool)
-	model, _ := chatReq["model"].(string)
-	setRequestLogInfo(w, model, requestReasoningForLog(chatReq))
-	if isImageOnlyModel(model) {
-		writeError(w, 400, "unsupported_model", fmt.Sprintf("%s is an image-only model; use /v1/images/generations or /v1/images/edits instead of /v1/chat/completions", model))
+	clientModel, _ := chatReq["model"].(string)
+	auth.ResolveFastMode(chatReq, r.Header.Get("X-Codex-Fast"))
+	upstreamModel, _ := chatReq["model"].(string)
+	serviceTier, _ := chatReq["service_tier"].(string)
+	setRequestLogInfo(w, upstreamModel, serviceTier, requestReasoningForLog(chatReq))
+	if isImageOnlyModel(upstreamModel) {
+		writeError(w, 400, "unsupported_model", fmt.Sprintf("%s is an image-only model; use /v1/images/generations or /v1/images/edits instead of /v1/chat/completions", upstreamModel))
 		return
 	}
 	includeUsage := false
@@ -659,7 +671,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if clientWantsStream {
-		streamChatCompletion(w, resp, model, includeUsage)
+		streamChatCompletion(w, resp, clientModel, includeUsage)
 	} else {
 		respObj, err := aggregateCodexResponse(resp.Body)
 		if err != nil {
@@ -670,7 +682,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 502, "upstream_error", "no response from upstream")
 			return
 		}
-		converted := convertToOpenAIFormat(respObj, chatReq)
+		converted := convertToOpenAIFormat(respObj, map[string]interface{}{"model": clientModel})
 		w.Header().Set("Content-Type", "application/json")
 		writeTracked(w, converted, "chat completion response write failed")
 	}
@@ -705,8 +717,10 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	clientWantsStream, _ := anthropicReq["stream"].(bool)
 	clientModel, _ := anthropicReq["model"].(string)
 	chatReq := anthropicToChatRequest(anthropicReq)
+	auth.ResolveFastMode(chatReq, r.Header.Get("X-Codex-Fast"))
 	upstreamModel, _ := chatReq["model"].(string)
-	setRequestLogInfo(w, upstreamModel, requestReasoningForLog(chatReq))
+	serviceTier, _ := chatReq["service_tier"].(string)
+	setRequestLogInfo(w, upstreamModel, serviceTier, requestReasoningForLog(chatReq))
 
 	// Codex /responses emits SSE; aggregate for non-streaming Anthropic
 	// clients and translate to Anthropic SSE for streaming clients.
@@ -1976,15 +1990,21 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	var reqMap map[string]interface{}
 	isStreaming := false
+	requestChanged := false
 	if json.Unmarshal(body, &reqMap) == nil {
 		isStreaming, _ = reqMap["stream"].(bool)
+		requestChanged = auth.ResolveFastMode(reqMap, r.Header.Get("X-Codex-Fast"))
 		model, _ := reqMap["model"].(string)
-		setRequestLogInfo(w, model, requestReasoningForLog(reqMap))
+		serviceTier, _ := reqMap["service_tier"].(string)
+		setRequestLogInfo(w, model, serviceTier, requestReasoningForLog(reqMap))
 	}
 
 	upstreamBody := body
 	if !isStreaming && reqMap != nil {
 		reqMap["stream"] = true
+		requestChanged = true
+	}
+	if requestChanged {
 		upstreamBody, err = json.Marshal(reqMap)
 		if err != nil {
 			writeError(w, 500, "internal", "failed to build upstream request")
@@ -2618,7 +2638,7 @@ func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, X-Codex-Fast")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)
@@ -2643,6 +2663,9 @@ func withLogging(next http.Handler) http.Handler {
 		if lw.model != "" {
 			args = append(args, "model", lw.model)
 		}
+		if lw.serviceTier != "" {
+			args = append(args, "service_tier", lw.serviceTier)
+		}
 		if lw.reasoning != nil {
 			args = append(args, "reasoning", lw.reasoning)
 		}
@@ -2652,9 +2675,10 @@ func withLogging(next http.Handler) http.Handler {
 
 type logWriter struct {
 	http.ResponseWriter
-	statusCode int
-	model      string
-	reasoning  interface{}
+	statusCode  int
+	model       string
+	serviceTier string
+	reasoning   interface{}
 }
 
 func (lw *logWriter) WriteHeader(code int) {
@@ -2662,8 +2686,9 @@ func (lw *logWriter) WriteHeader(code int) {
 	lw.ResponseWriter.WriteHeader(code)
 }
 
-func (lw *logWriter) SetRequestLogInfo(model string, reasoning interface{}) {
+func (lw *logWriter) SetRequestLogInfo(model, serviceTier string, reasoning interface{}) {
 	lw.model = model
+	lw.serviceTier = serviceTier
 	lw.reasoning = reasoning
 }
 
@@ -2674,12 +2699,12 @@ func (lw *logWriter) Flush() {
 }
 
 type requestLogInfoSetter interface {
-	SetRequestLogInfo(model string, reasoning interface{})
+	SetRequestLogInfo(model, serviceTier string, reasoning interface{})
 }
 
-func setRequestLogInfo(w http.ResponseWriter, model string, reasoning interface{}) {
+func setRequestLogInfo(w http.ResponseWriter, model, serviceTier string, reasoning interface{}) {
 	if setter, ok := w.(requestLogInfoSetter); ok {
-		setter.SetRequestLogInfo(model, reasoning)
+		setter.SetRequestLogInfo(model, serviceTier, reasoning)
 	}
 }
 

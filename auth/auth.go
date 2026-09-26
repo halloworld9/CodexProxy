@@ -902,25 +902,41 @@ func openBrowser(url string) {
 	}
 }
 
+type ModelInfo struct {
+	Slug         string
+	SupportsFast bool
+}
+
 func DiscoverModels(accessToken string) ([]string, error) {
-	return discoverModels(context.Background(), bearerCodexAuth(accessToken, ""))
+	models, err := discoverModelInfo(context.Background(), bearerCodexAuth(accessToken, ""))
+	return modelSlugs(models), err
 }
 
 // DiscoverModelsForManager discovers models using the account's auth mode
 // (AgentAssertion for agent-identity credentials, Bearer otherwise).
 func DiscoverModelsForManager(ctx context.Context, tm *TokenManager) ([]string, error) {
+	models, err := DiscoverModelInfoForManager(ctx, tm)
+	return modelSlugs(models), err
+}
+
+func DiscoverModelInfoForManager(ctx context.Context, tm *TokenManager) ([]ModelInfo, error) {
 	if _, err := tm.EnsureFreshToken(); err != nil {
 		return nil, err
 	}
 	auth := tm.codexAuthFunc(tm.AccountID())
-	models, err := discoverModels(ctx, auth)
+	models, err := discoverModelInfo(ctx, auth)
 	if err != nil && tm.retryAgentAuth(err) {
-		models, err = discoverModels(ctx, auth)
+		models, err = discoverModelInfo(ctx, auth)
 	}
 	return models, err
 }
 
 func discoverModels(ctx context.Context, auth codexAuthFunc) ([]string, error) {
+	models, err := discoverModelInfo(ctx, auth)
+	return modelSlugs(models), err
+}
+
+func discoverModelInfo(ctx context.Context, auth codexAuthFunc) ([]ModelInfo, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", CodexBaseURL+"/models?client_version=1.0.0", nil)
 	req.Header.Set("Content-Type", "application/json")
 	if err := auth(ctx, req); err != nil {
@@ -940,7 +956,10 @@ func discoverModels(ctx context.Context, auth codexAuthFunc) ([]string, error) {
 
 	var result struct {
 		Models []struct {
-			Slug string `json:"slug"`
+			Slug         string `json:"slug"`
+			ServiceTiers []struct {
+				ID string `json:"id"`
+			} `json:"service_tiers"`
 		} `json:"models"`
 	}
 
@@ -951,14 +970,74 @@ func discoverModels(ctx context.Context, auth codexAuthFunc) ([]string, error) {
 		if err2 := json.Unmarshal(body, &slugs); err2 != nil {
 			return nil, fmt.Errorf("cannot parse models response: %s", string(body[:min(200, len(body))]))
 		}
-		return slugs, nil
+		models := make([]ModelInfo, len(slugs))
+		for i, slug := range slugs {
+			models[i].Slug = slug
+		}
+		return models, nil
 	}
 
-	models := make([]string, len(result.Models))
+	models := make([]ModelInfo, len(result.Models))
 	for i, m := range result.Models {
-		models[i] = m.Slug
+		models[i].Slug = m.Slug
+		for _, tier := range m.ServiceTiers {
+			if tier.ID == "priority" {
+				models[i].SupportsFast = true
+				break
+			}
+		}
 	}
 	return models, nil
+}
+
+func modelSlugs(models []ModelInfo) []string {
+	if models == nil {
+		return nil
+	}
+	slugs := make([]string, len(models))
+	for i, model := range models {
+		slugs[i] = model.Slug
+	}
+	return slugs
+}
+
+// ResolveFastMode applies the model alias, body field, and header override.
+func ResolveFastMode(req map[string]interface{}, headerValue string) bool {
+	changed := false
+	model, _ := req["model"].(string)
+	aliasFast := strings.HasSuffix(model, "-fast") && strings.TrimSuffix(model, "-fast") != ""
+	if aliasFast {
+		req["model"] = strings.TrimSuffix(model, "-fast")
+		changed = true
+	}
+
+	tier, tierIsString := req["service_tier"].(string)
+	if _, exists := req["service_tier"]; exists && !tierIsString {
+		delete(req, "service_tier")
+		changed = true
+	}
+	if tier == "fast" {
+		req["service_tier"] = "priority"
+		changed = true
+	}
+	if _, ok := req["service_tier"]; !ok && aliasFast {
+		req["service_tier"] = "priority"
+		changed = true
+	}
+
+	switch strings.ToLower(strings.TrimSpace(headerValue)) {
+	case "1", "true", "on", "yes":
+		if req["service_tier"] != "priority" {
+			req["service_tier"] = "priority"
+			changed = true
+		}
+	case "0", "false", "off", "no":
+		if _, ok := req["service_tier"]; ok {
+			delete(req, "service_tier")
+			changed = true
+		}
+	}
+	return changed
 }
 
 var (
@@ -1649,6 +1728,11 @@ func BuildCodexRequestBody(chatReq map[string]interface{}) ([]byte, error) {
 		if v, ok := chatReq[key]; ok {
 			codexReq[key] = v
 		}
+	}
+	// Other OpenAI tiers ("auto", "default", "scale") are not Codex tiers.
+	switch tier, _ := chatReq["service_tier"].(string); tier {
+	case "priority", "flex":
+		codexReq["service_tier"] = tier
 	}
 	// temperature/top_p are rejected by reasoning models (gpt-5*, o-series,
 	// codex). Codex CLI never sends them for those. Forward only otherwise.

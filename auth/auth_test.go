@@ -6,12 +6,106 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestDiscoverModelInfoParsesFastSupport(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+
+	tests := []struct {
+		name     string
+		body     string
+		want     []ModelInfo
+		oldSlugs []string
+	}{
+		{
+			name: "object response",
+			body: `{"models":[
+				{"slug":"gpt-5.5","service_tiers":[{"id":"priority","name":"Fast"}]},
+				{"slug":"gpt-5.4","service_tiers":[{"id":"standard"}]}
+			]}`,
+			want:     []ModelInfo{{Slug: "gpt-5.5", SupportsFast: true}, {Slug: "gpt-5.4"}},
+			oldSlugs: []string{"gpt-5.5", "gpt-5.4"},
+		},
+		{
+			name:     "bare array fallback",
+			body:     `["gpt-5.5","gpt-5.4"]`,
+			want:     []ModelInfo{{Slug: "gpt-5.5"}, {Slug: "gpt-5.4"}},
+			oldSlugs: []string{"gpt-5.5", "gpt-5.4"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			httpClient = &http.Client{Transport: modelRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(tt.body)),
+					Header:     make(http.Header),
+				}, nil
+			})}
+			authFn := func(context.Context, *http.Request) error { return nil }
+			got, err := discoverModelInfo(context.Background(), authFn)
+			if err != nil {
+				t.Fatalf("discoverModelInfo: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("models = %#v, want %#v", got, tt.want)
+			}
+			slugs, err := discoverModels(context.Background(), authFn)
+			if err != nil {
+				t.Fatalf("discoverModels: %v", err)
+			}
+			if !reflect.DeepEqual(slugs, tt.oldSlugs) {
+				t.Fatalf("slugs = %#v, want %#v", slugs, tt.oldSlugs)
+			}
+		})
+	}
+}
+
+type modelRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f modelRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestResolveFastMode(t *testing.T) {
+	tests := []struct {
+		name       string
+		req        map[string]interface{}
+		header     string
+		wantModel  string
+		wantTier   string
+		wantTierOK bool
+	}{
+		{name: "alias", req: map[string]interface{}{"model": "gpt-5.5-fast"}, wantModel: "gpt-5.5", wantTier: "priority", wantTierOK: true},
+		{name: "body fast", req: map[string]interface{}{"model": "gpt-5.5", "service_tier": "fast"}, wantModel: "gpt-5.5", wantTier: "priority", wantTierOK: true},
+		{name: "body passthrough", req: map[string]interface{}{"model": "gpt-5.5", "service_tier": "standard"}, wantModel: "gpt-5.5", wantTier: "standard", wantTierOK: true},
+		{name: "header on", req: map[string]interface{}{"model": "gpt-5.5"}, header: "YeS", wantModel: "gpt-5.5", wantTier: "priority", wantTierOK: true},
+		{name: "header off", req: map[string]interface{}{"model": "gpt-5.5-fast", "service_tier": "standard"}, header: "FALSE", wantModel: "gpt-5.5", wantTierOK: false},
+		{name: "empty alias", req: map[string]interface{}{"model": "-fast"}, wantModel: "-fast", wantTierOK: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ResolveFastMode(tt.req, tt.header)
+			if tt.req["model"] != tt.wantModel {
+				t.Fatalf("model = %v, want %s", tt.req["model"], tt.wantModel)
+			}
+			tier, ok := tt.req["service_tier"].(string)
+			if ok != tt.wantTierOK || tier != tt.wantTier {
+				t.Fatalf("service_tier = %q, %v; want %q, %v", tier, ok, tt.wantTier, tt.wantTierOK)
+			}
+		})
+	}
+}
 
 func TestBuildCodexRequestBody(t *testing.T) {
 	chatReq := map[string]interface{}{
